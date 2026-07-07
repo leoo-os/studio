@@ -2,7 +2,6 @@ import streamlit as st
 import json
 import os
 import requests
-import uuid
 
 # 1. KONFIGURÁCIÓ ÉS KLIENSEK
 def load_config():
@@ -45,7 +44,7 @@ def get_shopify_token():
         st.error(f"Shopify OAuth kapcsolódási hiba: {e}")
         return None
 
-# 3. KÉPFELTÖLTÉS NYERS MULTIPART KÓDOLÁSSAL (A GOOGLE SIGNATURE MIATT)
+# 3. KÉPFELTÖLTÉS A SHOPIFY CDN-RE (HIVATALOS, SORRENDTARTÓ MEGOLDÁS)
 def upload_image_to_shopify(token, file_bytes, file_name):
     shop = config["shopify"]["shop_url"]
     headers = {"X-Shopify-Access-Token": token, "Content-Type": "application/json"}
@@ -70,30 +69,16 @@ def upload_image_to_shopify(token, file_bytes, file_name):
         target = res["data"]["stagedUploadsCreate"]["stagedTargets"][0]
         upload_url = target["url"]
         
-        # --- NYERS MULTIPART MEGOLDÁS ---
-        # Létrehozunk egy teljesen egyedi boundary-t
-        boundary = f"----WebKitFormBoundary{uuid.uuid4().hex}"
-        body_bytes = b""
-        
-        # 1. Hozzáadjuk a Shopify paramétereit SZIGORÚAN az eredeti sorrendben
+        # Szigorú sorrend megtartása listával a requests számára
+        form_data = []
         for p in target["parameters"]:
-            body_bytes += f"--{boundary}\r\n".encode('utf-8')
-            body_bytes += f'Content-Disposition: form-data; name="{p["name"]}"\r\n\r\n'.encode('utf-8')
-            body_bytes += f"{p['value']}\r\n".encode('utf-8')
+            form_data.append((p["name"], p["value"]))
             
-        # 2. A legvégére szúrjuk be a konkrét fájlt
-        body_bytes += f"--{boundary}\r\n".encode('utf-8')
-        body_bytes += f'Content-Disposition: form-data; name="file"; filename="{file_name}"\r\n'.encode('utf-8')
-        body_bytes += b"Content-Type: image/jpeg\r\n\r\n"
-        body_bytes += file_bytes
-        body_bytes += b"\r\n"
+        # A fájlt külön adjuk át, így a requests könyvtár építi fel a valid multipart kérést
+        files = {"file": (file_name, file_bytes, "image/jpeg")}
         
-        # 3. Lezárjuk a teljes kérést
-        body_bytes += f"--{boundary}--\r\n".encode('utf-8')
-        
-        # Elküldjük a Google-nek a kézzel felépített kérést
-        gcloud_headers = {"Content-Type": f"multipart/form-data; boundary={boundary}"}
-        gcloud_res = requests.post(upload_url, data=body_bytes, headers=gcloud_headers)
+        # Küldés a Google Cloud-nak (data=form_data listaként biztosítja a pontos sorrendet)
+        gcloud_res = requests.post(upload_url, data=form_data, files=files)
         
         if gcloud_res.status_code not in [200, 201]:
             st.error(f"Tárhely feltöltési hiba ({gcloud_res.status_code}): {gcloud_res.text}")
