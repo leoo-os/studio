@@ -2,6 +2,7 @@ import streamlit as st
 import json
 import os
 import requests
+import uuid
 
 # 1. KONFIGURÁCIÓ ÉS KLIENSEK
 def load_config():
@@ -13,36 +14,38 @@ def load_config():
 
 config = load_config()
 
-# 2. TERMÉKCSOPORTONKÉNTI ÁRAK BEÁLLÍTÁSA (KÓDBAN)
-# Itt adhatod meg, hogy melyik kezdőbetűhöz milyen ár tartozzon!
 TERMÉK_ÁRAK = {
-    "D": 14900,   # Pl: D0001_1 -> 14.900 HUF
-    "A": 19900,   # Pl: A0001_1 -> 19.900 HUF (csak példa)
-    "STANDARD": 14900  # Ha nem ismeri fel a kezdőbetűt, ez lesz az alapértelmezett ár
+    "D": 14900,
+    "STANDARD": 14900
 }
 
 def get_price_by_sku(sku):
     first_letter = sku[0].upper() if sku else ""
     return TERMÉK_ÁRAK.get(first_letter, TERMÉK_ÁRAK["STANDARD"])
 
-# 3. SHOPIFY TOKEN LEKÉRÉS
+# 2. ÚJ TÍPUSÚ AUTOMATA TOKEN IGÉNYLÉS (2026+ Shopify OAuth)
 def get_shopify_token():
     shop = config["shopify"]["shop_url"]
+    client_id = config["shopify"]["client_id"]
+    client_secret = config["shopify"]["client_secret"]
+    
     url = f"https://{shop}/admin/oauth/access_token"
+    headers = {"Content-Type": "application/x-www-form-urlencoded"}
     payload = {
         "grant_type": "client_credentials",
-        "client_id": config["shopify"]["client_id"],
-        "client_secret": config["shopify"]["client_secret"]
+        "client_id": client_id,
+        "client_secret": client_secret
     }
+    
     try:
-        response = requests.post(url, json=payload)
+        response = requests.post(url, data=payload, headers=headers)
         response.raise_for_status()
         return response.json().get("access_token")
     except Exception as e:
-        st.error(f"Shopify Token hiba: {e}")
+        st.error(f"Shopify OAuth kapcsolódási hiba: {e}")
         return None
 
-# 4. KÉPFELTÖLTÉS A SHOPIFY CDN-RE
+# 3. KÉPFELTÖLTÉS NYERS MULTIPART KÓDOLÁSSAL (A GOOGLE SIGNATURE MIATT)
 def upload_image_to_shopify(token, file_bytes, file_name):
     shop = config["shopify"]["shop_url"]
     headers = {"X-Shopify-Access-Token": token, "Content-Type": "application/json"}
@@ -52,20 +55,56 @@ def upload_image_to_shopify(token, file_bytes, file_name):
     mutation stagedUploadsCreate($input: [StagedUploadInput!]!) {
       stagedUploadsCreate(input: $input) {
         stagedTargets { url resourceUrl parameters { name value } }
+        userErrors { field message }
       }
     }
     """
     try:
+        # Engedély kérése a Shopify-tól
         res = requests.post(url, json={"query": staged_query, "variables": {"input": [{"filename": file_name, "mimeType": "image/jpeg", "resource": "FILE", "fileSize": str(len(file_bytes))}]}}, headers=headers).json()
-        target = res["data"]["stagedUploadsCreate"]["stagedTargets"][0]
         
-        requests.post(target["url"], data={p["name"]: p["value"] for p in target["parameters"]}, files={"file": (file_name, file_bytes, "image/jpeg")})
+        if "errors" in res or res.get("data", {}).get("stagedUploadsCreate", {}).get("userErrors"):
+            st.error(f"Shopify Staged Upload hiba: {res}")
+            return None
+            
+        target = res["data"]["stagedUploadsCreate"]["stagedTargets"][0]
+        upload_url = target["url"]
+        
+        # --- NYERS MULTIPART MEGOLDÁS ---
+        # Létrehozunk egy teljesen egyedi boundary-t
+        boundary = f"----WebKitFormBoundary{uuid.uuid4().hex}"
+        body_bytes = b""
+        
+        # 1. Hozzáadjuk a Shopify paramétereit SZIGORÚAN az eredeti sorrendben
+        for p in target["parameters"]:
+            body_bytes += f"--{boundary}\r\n".encode('utf-8')
+            body_bytes += f'Content-Disposition: form-data; name="{p["name"]}"\r\n\r\n'.encode('utf-8')
+            body_bytes += f"{p['value']}\r\n".encode('utf-8')
+            
+        # 2. A legvégére szúrjuk be a konkrét fájlt
+        body_bytes += f"--{boundary}\r\n".encode('utf-8')
+        body_bytes += f'Content-Disposition: form-data; name="file"; filename="{file_name}"\r\n'.encode('utf-8')
+        body_bytes += b"Content-Type: image/jpeg\r\n\r\n"
+        body_bytes += file_bytes
+        body_bytes += b"\r\n"
+        
+        # 3. Lezárjuk a teljes kérést
+        body_bytes += f"--{boundary}--\r\n".encode('utf-8')
+        
+        # Elküldjük a Google-nek a kézzel felépített kérést
+        gcloud_headers = {"Content-Type": f"multipart/form-data; boundary={boundary}"}
+        gcloud_res = requests.post(upload_url, data=body_bytes, headers=gcloud_headers)
+        
+        if gcloud_res.status_code not in [200, 201]:
+            st.error(f"Tárhely feltöltési hiba ({gcloud_res.status_code}): {gcloud_res.text}")
+            return None
+            
         return target["resourceUrl"]
     except Exception as e:
-        st.error(f"Képfeltöltési hiba ({file_name}): {e}")
+        st.error(f"Képfeltöltési kivétel ({file_name}): {e}")
         return None
 
-# 5. LÉTEZŐ TERMÉK KERESÉSE SKU ALAPJÁN
+# 4. LÉTEZŐ TERMÉK KERESÉSE SKU ALAPJÁN
 def find_shopify_product_by_sku(token, sku):
     shop = config["shopify"]["shop_url"]
     url = f"https://{shop}/admin/api/2026-07/graphql.json"
@@ -91,7 +130,7 @@ def find_shopify_product_by_sku(token, sku):
     except:
         return None
 
-# 6. ÚJ TERMÉK LÉTREHOZÁSA KÉSZLETTEL (Közvetlenül beállítva a megadott darabszámot)
+# 5. ÚJ TERMÉK LÉTREHOZÁSA KÉSZLETTEL
 def create_shopify_product(token, title, description, price, sku, image_url, quantity, location_id):
     shop = config["shopify"]["shop_url"]
     url = f"https://{shop}/admin/api/2026-07/graphql.json"
@@ -130,7 +169,9 @@ def create_shopify_product(token, title, description, price, sku, image_url, qua
     
     res = requests.post(url, json={"query": query, "variables": variables}, headers=headers).json()
     
-    # Ha sikeres a létrehozás, beállítjuk a darabszámot is a megadott helyszínre (Location ID)
+    if res.get("data", {}).get("productCreate", {}).get("userErrors"):
+        st.error(f"Shopify terméklétrehozási hiba: {res['data']['productCreate']['userErrors']}")
+    
     try:
         product_data = res["data"]["productCreate"]["product"]
         inventory_item_id = product_data["variants"]["edges"][0]["node"]["inventoryItem"]["id"]
@@ -138,7 +179,6 @@ def create_shopify_product(token, title, description, price, sku, image_url, qua
         inventory_query = """
         mutation inventorySetQuantities($input: InventorySetQuantitiesInput!) {
           inventorySetQuantities(input: $input) {
-            inventoryAdjustmentGroup { createdAt }
             userErrors { field message }
           }
         }
@@ -156,11 +196,11 @@ def create_shopify_product(token, title, description, price, sku, image_url, qua
         }
         requests.post(url, json={"query": inventory_query, "variables": inventory_variables}, headers=headers)
     except:
-        pass # Ha a készletállítás nem sikerül, a termék magában még létrejön
+        pass
         
     return res
 
-# 7. ÚJ KÉP HOZZÁADÁSA LÉTEZŐ TERMÉKHEZ
+# 6. ÚJ KÉP HOZZÁADÁSA LÉTEZŐ TERMÉKHEZ
 def append_image_to_product(token, product_id, image_url):
     shop = config["shopify"]["shop_url"]
     url = f"https://{shop}/admin/api/2026-07/graphql.json"
@@ -170,6 +210,7 @@ def append_image_to_product(token, product_id, image_url):
     mutation productCreateMedia($productId: ID!, $media: [CreateMediaInput!]!) {
       productCreateMedia(productId: $productId, media: $media) {
         media { id }
+        userErrors { field message }
       }
     }
     """
@@ -177,23 +218,27 @@ def append_image_to_product(token, product_id, image_url):
         "productId": product_id,
         "media": [{"mediaContentType": "IMAGE", "originalSource": image_url}]
     }
-    return requests.post(url, json={"query": query, "variables": variables}, headers=headers).json()
+    res = requests.post(url, json={"query": query, "variables": variables}, headers=headers).json()
+    if res.get("data", {}).get("productCreateMedia", {}).get("userErrors"):
+        st.error(f"Galéria bővítési hiba: {res['data']['productCreateMedia']['userErrors']}")
+    return res
 
 
 # STREAMLIT FELÜLET
 st.set_page_config(page_title="DODO Studio v2", page_icon="🦖")
-st.title("DODO Studio v2 — Gyors Szinkron 🚀")
+st.title("DODO Studio v2 🚀")
 
-# Csak a legszükségesebb mezők maradtak
 uploaded_files = st.file_uploader("Fájlok kiválasztása (pl: D0001_1.jpg, D0001_2.jpg)", type=["jpg", "jpeg", "png"], accept_multiple_files=True)
 quantity = st.number_input("Darabszám (Készlet)", min_value=0, value=1)
 
-# Lekérjük a configból a Location ID-t, ha nincs benne, használ egy alapértelmezettet
-location_id = config["shopify"].get("location_id", "gid://shopify/Location/YOUR_LOCATION_ID")
+location_id = config["shopify"]["location_id"]
 
 if st.button("🚀 FELTÖLTÉS INDÍTÁSA") and uploaded_files:
-    token = get_shopify_token()
+    with st.spinner("Shopify API hozzáférés egyeztetése..."):
+        token = get_shopify_token()
+        
     if not token:
+        st.error("Nem sikerült tokent szerezni a Shopify-tól a megadott Client ID / Secret párossal.")
         st.stop()
         
     sorted_files = sorted(uploaded_files, key=lambda x: x.name)
@@ -209,34 +254,32 @@ if st.button("🚀 FELTÖLTÉS INDÍTÁSA") and uploaded_files:
             sku = raw_filename.upper()
             view_number = "1"
             
-        # Ár meghatározása automatikusan a kód szerinti táblázatból
         product_price = get_price_by_sku(sku)
-        
-        st.markdown(f"📂 Fájl: `{f.name}` $\rightarrow$ **SKU: {sku}** | Nézet: {view_number} | Ár: {product_price} HUF")
+        st.markdown(f"📂 Fájl: `{f.name}` $\rightarrow$ **SKU: {sku}** (Nézet: {view_number})")
         
         with st.spinner(f"Feldolgozás..."):
             try:
                 file_bytes = f.getvalue()
                 existing_product_id = find_shopify_product_by_sku(token, sku)
+                
+                st.write("Kép feltöltése folyamatban...")
                 img_url = upload_image_to_shopify(token, file_bytes, f.name)
                 
                 if not img_url:
+                    st.error(f"A(z) {f.name} kép feltöltése megszakadt, ugrom a következőt.")
                     continue
                 
                 if existing_product_id:
+                    st.write("Termék létezik, kép hozzáadása a galériához...")
                     append_image_to_product(token, existing_product_id, img_url)
                     st.success(f"✓ Kép hozzáadva a meglévő `{sku}` galériájához.")
                 else:
-                    # AI generálás az első képnél
+                    st.write("Új termék létrehozása...")
                     ai_title = f"DODO Art - [{sku}]"
-                    prompt = f"Írj egy rövid, megható, varázslatos 3-4 mondatos háttértörténetet egy kézműves Dodó madár figurának, aminek a cikkszáma: {sku}."
-                    
-                    # (Az OpenAI és Supabase hívások a háttérben futnak a háttértörténethez...)
-                    # A kódod többi része változatlanul menti és beküldi ide a terméket
-                    create_shopify_product(token, ai_title, "AI által generált leírás...", product_price, sku, img_url, quantity, location_id)
+                    create_shopify_product(token, ai_title, "AI által generált leírás helye...", product_price, sku, img_url, quantity, location_id)
                     st.success(f"🎉 Új termék létrehozva `{sku}` néven, {quantity} db készlettel!")
                     
             except Exception as e:
-                st.error(f"Hiba: {e}")
+                st.error(f"Hiba történt a fájl közben: {e}")
                 
     st.balloons()
