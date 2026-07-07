@@ -1,2 +1,2 @@
-# studio
-Leoo Studio OS
+# dodo-studio
+Dodo Studio
