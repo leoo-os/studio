@@ -1,270 +1,120 @@
 import streamlit as st
+import base64
 import json
 import os
-import requests
+from core.ai import AIEngine
+from core.schema import ProductSchema, MemoryItem
+from core.validator import SchemaValidator
+from core.exporter import ShopifyExporter
+from core.database import DatabaseManager
 
-# 1. KONFIGURÁCIÓ ÉS KLIENSEK
-def load_config():
-    if not os.path.exists("config/config.json"):
-        st.error("Hiba: A config/config.json fájl nem található a helyi gépeden!")
-        st.stop()
-    with open("config/config.json", "r") as f:
-        return json.load(f)
+st.set_page_config(page_title="DODO Studio v2", page_icon="🦖", layout="centered")
+st.title("🦖 DODO Studio v2")
+st.write("Moduláris termékgenerátor automatizált API és Supabase szinkronizációval.")
 
-config = load_config()
+# --- API KULCS AUTOMATIKUS BEOLVASÁSA A CONFIGBÓL ---
+try:
+    with open("config/config.json", "r", encoding="utf-8") as f:
+        config_data = json.load(f)
+    api_key = config_data["openai"]["api_key"]
+    os.environ["OPENAI_API_KEY"] = api_key
+except Exception:
+    st.error("Kritikus hiba: Nem sikerült beolvasni az OpenAI API kulcsot a config/config.json fájlból!")
+    st.stop()
 
-TERMÉK_ÁRAK = {
-    "D": 14900,
-    "STANDARD": 14900
-}
+uploaded_file = st.file_uploader("1. Lépés: Dodó kép feltöltése", type=["jpg", "jpeg", "png"])
 
-def get_price_by_sku(sku):
-    first_letter = sku[0].upper() if sku else ""
-    return TERMÉK_ÁRAK.get(first_letter, TERMÉK_ÁRAK["STANDARD"])
+st.subheader("2. Lépés: Felhasználói metaadatok")
+col1, col2 = st.columns(2)
+with col1:
+    collection = st.text_input("Kollekció (pl. Geese)", value="")
+    inventory_qty = st.number_input("Kezdő készlet", min_value=0, value=5, step=1)
+with col2:
+    function = st.text_input("Funkció (pl. Bowl)", value="")
+    variant_name = st.text_input("Variáns név (opcionális)", value="")
 
-# 2. ÚJ TÍPUSÚ AUTOMATA TOKEN IGÉNYLÉS (2026+ Shopify OAuth)
-def get_shopify_token():
-    shop = config["shopify"]["shop_url"]
-    client_id = config["shopify"]["client_id"]
-    client_secret = config["shopify"]["client_secret"]
-    
-    url = f"https://{shop}/admin/oauth/access_token"
-    headers = {"Content-Type": "application/x-www-form-urlencoded"}
-    payload = {
-        "grant_type": "client_credentials",
-        "client_id": client_id,
-        "client_secret": client_secret
-    }
-    
-    try:
-        response = requests.post(url, data=payload, headers=headers)
-        response.raise_for_status()
-        return response.json().get("access_token")
-    except Exception as e:
-        st.error(f"Shopify OAuth kapcsolódási hiba: {e}")
-        return None
-
-# 3. KÉPFELTÖLTÉS A SHOPIFY CDN-RE (HIVATALOS, SORRENDTARTÓ MEGOLDÁS)
-def upload_image_to_shopify(token, file_bytes, file_name):
-    shop = config["shopify"]["shop_url"]
-    headers = {"X-Shopify-Access-Token": token, "Content-Type": "application/json"}
-    url = f"https://{shop}/admin/api/2026-07/graphql.json"
-    
-    staged_query = """
-    mutation stagedUploadsCreate($input: [StagedUploadInput!]!) {
-      stagedUploadsCreate(input: $input) {
-        stagedTargets { url resourceUrl parameters { name value } }
-        userErrors { field message }
-      }
-    }
-    """
-    try:
-        # Engedély kérése a Shopify-tól
-        res = requests.post(url, json={"query": staged_query, "variables": {"input": [{"filename": file_name, "mimeType": "image/jpeg", "resource": "FILE", "fileSize": str(len(file_bytes))}]}}, headers=headers).json()
-        
-        if "errors" in res or res.get("data", {}).get("stagedUploadsCreate", {}).get("userErrors"):
-            st.error(f"Shopify Staged Upload hiba: {res}")
-            return None
-            
-        target = res["data"]["stagedUploadsCreate"]["stagedTargets"][0]
-        upload_url = target["url"]
-        
-        # Szigorú sorrend megtartása listával a requests számára
-        form_data = []
-        for p in target["parameters"]:
-            form_data.append((p["name"], p["value"]))
-            
-        # A fájlt külön adjuk át, így a requests könyvtár építi fel a valid multipart kérést
-        files = {"file": (file_name, file_bytes, "image/jpeg")}
-        
-        # Küldés a Google Cloud-nak (data=form_data listaként biztosítja a pontos sorrendet)
-        gcloud_res = requests.post(upload_url, data=form_data, files=files)
-        
-        if gcloud_res.status_code not in [200, 201]:
-            st.error(f"Tárhely feltöltési hiba ({gcloud_res.status_code}): {gcloud_res.text}")
-            return None
-            
-        return target["resourceUrl"]
-    except Exception as e:
-        st.error(f"Képfeltöltési kivétel ({file_name}): {e}")
-        return None
-
-# 4. LÉTEZŐ TERMÉK KERESÉSE SKU ALAPJÁN
-def find_shopify_product_by_sku(token, sku):
-    shop = config["shopify"]["shop_url"]
-    url = f"https://{shop}/admin/api/2026-07/graphql.json"
-    headers = {"X-Shopify-Access-Token": token, "Content-Type": "application/json"}
-    
-    query = """
-    query($query: String!) {
-      products(first: 1, query: $query) {
-        edges {
-          node {
-            id
-          }
-        }
-      }
-    }
-    """
-    try:
-        res = requests.post(url, json={"query": query, "variables": {"query": f"sku:{sku}"}}, headers=headers).json()
-        edges = res["data"]["products"]["edges"]
-        if edges:
-            return edges[0]["node"]["id"]
-        return None
-    except:
-        return None
-
-# 5. ÚJ TERMÉK LÉTREHOZÁSA KÉSZLETTEL
-def create_shopify_product(token, title, description, price, sku, image_url, quantity, location_id):
-    shop = config["shopify"]["shop_url"]
-    url = f"https://{shop}/admin/api/2026-07/graphql.json"
-    headers = {"X-Shopify-Access-Token": token, "Content-Type": "application/json"}
-    
-    query = """
-    mutation productCreate($input: ProductInput!, $media: [CreateMediaInput!]) {
-      productCreate(input: $input, media: $media) {
-        product { 
-          id 
-          title 
-          variants(first: 1) {
-            edges {
-              node {
-                id
-                inventoryItem {
-                  id
-                }
-              }
-            }
-          }
-        }
-        userErrors { field message }
-      }
-    }
-    """
-    variables = {
-        "input": {
-            "title": title, 
-            "descriptionHtml": f"<p>{description}</p>", 
-            "status": "DRAFT", 
-            "variants": [{"price": str(price), "sku": sku}]
-        },
-        "media": [{"mediaContentType": "IMAGE", "originalSource": image_url}]
-    }
-    
-    res = requests.post(url, json={"query": query, "variables": variables}, headers=headers).json()
-    
-    if res.get("data", {}).get("productCreate", {}).get("userErrors"):
-        st.error(f"Shopify terméklétrehozási hiba: {res['data']['productCreate']['userErrors']}")
-    
-    try:
-        product_data = res["data"]["productCreate"]["product"]
-        inventory_item_id = product_data["variants"]["edges"][0]["node"]["inventoryItem"]["id"]
-        
-        inventory_query = """
-        mutation inventorySetQuantities($input: InventorySetQuantitiesInput!) {
-          inventorySetQuantities(input: $input) {
-            userErrors { field message }
-          }
-        }
-        """
-        inventory_variables = {
-            "input": {
-                "name": "available",
-                "reason": "correction",
-                "quantities": [{
-                    "inventoryItemId": inventory_item_id,
-                    "locationId": location_id,
-                    "quantity": int(quantity)
-                }]
-            }
-        }
-        requests.post(url, json={"query": inventory_query, "variables": inventory_variables}, headers=headers)
-    except:
-        pass
-        
-    return res
-
-# 6. ÚJ KÉP HOZZÁADÁSA LÉTEZŐ TERMÉKHEZ
-def append_image_to_product(token, product_id, image_url):
-    shop = config["shopify"]["shop_url"]
-    url = f"https://{shop}/admin/api/2026-07/graphql.json"
-    headers = {"X-Shopify-Access-Token": token, "Content-Type": "application/json"}
-    
-    query = """
-    mutation productCreateMedia($productId: ID!, $media: [CreateMediaInput!]!) {
-      productCreateMedia(productId: $productId, media: $media) {
-        media { id }
-        userErrors { field message }
-      }
-    }
-    """
-    variables = {
-        "productId": product_id,
-        "media": [{"mediaContentType": "IMAGE", "originalSource": image_url}]
-    }
-    res = requests.post(url, json={"query": query, "variables": variables}, headers=headers).json()
-    if res.get("data", {}).get("productCreateMedia", {}).get("userErrors"):
-        st.error(f"Galéria bővítési hiba: {res['data']['productCreateMedia']['userErrors']}")
-    return res
-
-
-# STREAMLIT FELÜLET
-st.set_page_config(page_title="DODO Studio v2", page_icon="🦖")
-st.title("DODO Studio v2 🚀")
-
-uploaded_files = st.file_uploader("Fájlok kiválasztása (pl: D0001_1.jpg, D0001_2.jpg)", type=["jpg", "jpeg", "png"], accept_multiple_files=True)
-quantity = st.number_input("Darabszám (Készlet)", min_value=0, value=1)
-
-location_id = config["shopify"]["location_id"]
-
-if st.button("🚀 FELTÖLTÉS INDÍTÁSA") and uploaded_files:
-    with st.spinner("Shopify API hozzáférés egyeztetése..."):
-        token = get_shopify_token()
-        
-    if not token:
-        st.error("Nem sikerült tokent szerezni a Shopify-tól a megadott Client ID / Secret párossal.")
-        st.stop()
-        
-    sorted_files = sorted(uploaded_files, key=lambda x: x.name)
-    
-    for f in sorted_files:
-        st.write("---")
-        raw_filename = os.path.splitext(f.name)[0]
-        
-        if "_" in raw_filename:
-            sku = raw_filename.split("_")[0].upper()
-            view_number = raw_filename.split("_")[1]
-        else:
-            sku = raw_filename.upper()
-            view_number = "1"
-            
-        product_price = get_price_by_sku(sku)
-        st.markdown(f"📂 Fájl: `{f.name}` $\rightarrow$ **SKU: {sku}** (Nézet: {view_number})")
-        
-        with st.spinner(f"Feldolgozás..."):
+if st.button("🚀 Termék feldolgozása és szinkronizálása"):
+    if not api_key or api_key.startswith("sk-proj-IDE"):
+        st.error("Kérlek add meg a valós OpenAI API kulcsodat a config/config.json fájlban!")
+    elif not uploaded_file:
+        st.error("Kérlek tölts fel egy termékfotót!")
+    elif not collection or not function:
+        st.error("A Kollekció és Funkció mezők kitöltése kötelező!")
+    else:
+        with st.spinner("Moduláris feldolgozás (Vision -> Emlékprofil -> Supabase -> CSV)..."):
             try:
-                file_bytes = f.getvalue()
-                existing_product_id = find_shopify_product_by_sku(token, sku)
+                bytes_data = uploaded_file.getvalue()
+                base64_image = base64.b64encode(bytes_data).decode('utf-8')
+                full_filename = uploaded_file.name
+                sku = full_filename.split('_')[0] if '_' in full_filename else full_filename.split('.')[0]
+
+                ai_engine = AIEngine(api_key=api_key)
+                raw_ai_data = ai_engine.analyze_and_generate(
+                    base64_image=base64_image,
+                    sku=sku,
+                    collection=collection,
+                    function=function,
+                    variant=variant_name
+                )
+
+                price = "100.0" if "holder" in function.lower() else "50.0"
+
+                memories_list = []
+                for m in raw_ai_data["memories"]:
+                    memories_list.append(MemoryItem(**m))
+
+                tags_raw = raw_ai_data["seo"].get("tags", "")
+                tags_list = [t.strip() for t in tags_raw.split(",")] if isinstance(tags_raw, str) else []
+
+                product_object = ProductSchema(
+                    sku=sku,
+                    collection=collection,
+                    size=raw_ai_data["visual"].get("Size", "Standard"),
+                    function=function,
+                    title=raw_ai_data["title"],
+                    subtitle=f"A high-fired ceramic {function}",
+                    finish=raw_ai_data["visual"].get("Finish", "Glossy"),
+                    primary_color=raw_ai_data["visual"].get("Primary Colour", ""),
+                    secondary_color=raw_ai_data["visual"].get("Secondary Colour", ""),
+                    dimensions=raw_ai_data["visual"].get("Dimensions", ""),
+                    character=raw_ai_data["visual"].get("Image ALT", ""),
+                    html_description=raw_ai_data["html"].get("html_description", ""),
+                    seo_title=raw_ai_data["seo"].get("seo_title", raw_ai_data["title"]),
+                    seo_description=raw_ai_data["seo"].get("seo_description", ""),
+                    tags=tags_list,
+                    image_filename=full_filename,
+                    image_public_url=f"https://leoolimited.com/cdn/shop/files/{full_filename}",
+                    image_alt=raw_ai_data["visual"].get("Image ALT", ""),
+                    memories=memories_list,
+                    price=price,
+                    inventory_qty=int(inventory_qty),
+                    material="Ceramic",
+                    variant_name=variant_name
+                )
+
+                if not SchemaValidator.validate_product(product_object):
+                    st.error("Kritikus hiba: A termékadatok nem felelnek meg a DODO Standardnak!")
+                    st.stop()
+
+                csv_filename = f"shopify_import_{sku}.csv"
+                csv_buffer = ShopifyExporter.generate_csv_buffer(product_object)
+
+                db_manager = DatabaseManager()
+                db_id = db_manager.save_product_flow(product_object, csv_filename)
+
+                st.success(f"🎉 Sikeresen mentve a Supabase-be! (Termék ID: {db_id})")
                 
-                st.write("Kép feltöltése folyamatban...")
-                img_url = upload_image_to_shopify(token, file_bytes, f.name)
-                
-                if not img_url:
-                    st.error(f"A(z) {f.name} kép feltöltése megszakadt, ugrom a következőt.")
-                    continue
-                
-                if existing_product_id:
-                    st.write("Termék létezik, kép hozzáadása a galériához...")
-                    append_image_to_product(token, existing_product_id, img_url)
-                    st.success(f"✓ Kép hozzáadva a meglévő `{sku}` galériájához.")
-                else:
-                    st.write("Új termék létrehozása...")
-                    ai_title = f"DODO Art - [{sku}]"
-                    create_shopify_product(token, ai_title, "AI által generált leírás helye...", product_price, sku, img_url, quantity, location_id)
-                    st.success(f"🎉 Új termék létrehozva `{sku}` néven, {quantity} db készlettel!")
-                    
+                st.subheader("Előnézet:")
+                st.write(f"**Cím:** {product_object.title}")
+                st.write(f"**SKU:** {product_object.sku} | **Ár:** {product_object.price} €")
+                st.write(f"**Legenerált emberi emlékek száma:** {len(product_object.memories)} db")
+
+                st.download_button(
+                    label="💾 Shopify Import CSV Letöltése",
+                    data=csv_buffer,
+                    file_name=csv_filename,
+                    mime="text/csv"
+                )
+
             except Exception as e:
-                st.error(f"Hiba történt a fájl közben: {e}")
-                
-    st.balloons()
+                st.error(f"Hiba lépett fel a futtatáskor: {e}")
